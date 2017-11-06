@@ -3,6 +3,8 @@ package flv
 import (
 	"bufio"
 	"fmt"
+	"io"
+
 	"github.com/nareix/bits/pio"
 	"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/av/avutil"
@@ -11,7 +13,6 @@ import (
 	"github.com/nareix/joy4/codec/fake"
 	"github.com/nareix/joy4/codec/h264parser"
 	"github.com/nareix/joy4/format/flv/flvio"
-	"io"
 )
 
 var MaxProbePacketCount = 20
@@ -142,7 +143,16 @@ func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
 				self.GotAudio = true
 				self.CacheTag(tag, timestamp)
 			}
-
+		default:
+			if !self.GotAudio {
+				stream := fake.CodecData{
+					CodecType_: av.UNKNOWN,
+				}
+				self.AudioStreamIdx = len(self.Streams)
+				self.Streams = append(self.Streams, stream)
+				self.GotAudio = true
+				self.CacheTag(tag, timestamp)
+			}
 		}
 	}
 
