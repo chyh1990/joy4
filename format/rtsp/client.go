@@ -831,7 +831,7 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 		30-31    reserved                                     -
 	*/
 	switch {
-	case naluType >= 1 && naluType <= 5:
+	case naluType >= 1 && naluType <= 6:
 		if naluType == 5 {
 			self.pkt.IsKeyFrame = true
 		}
@@ -840,9 +840,13 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 		b := make([]byte, 4+len(packet))
 		pio.PutU32BE(b[0:4], uint32(len(packet)))
 		copy(b[4:], packet)
-		self.pkt.Data = b
+		// sei nalu
+		if naluType == 6 {
+			self.pkt.ExtraData = b
+		} else {
+			self.pkt.Data = b
+		}
 		self.timestamp = timestamp
-
 	case naluType == 7: // sps
 		if self.client != nil && self.client.DebugRtp {
 			fmt.Println("rtsp: got sps")

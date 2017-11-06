@@ -236,6 +236,7 @@ type Packet struct {
 	CompositionTime time.Duration // packet presentation time minus decode time for H264 B-Frame
 	Time            time.Duration // packet decode time
 	Data            []byte        // packet data
+	ExtraData       []byte        // data array for extra data, e.g: SEI
 }
 
 // Raw audio frame.
