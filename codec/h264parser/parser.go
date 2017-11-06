@@ -49,9 +49,49 @@ const (
 	PROFILE_ID_HIGH444_PREDICTIVE    = 244
 )
 
+const (
+	EXTENDED_SAR                 = 255
+	H264_SCALING_LIST_4X4_LENGTH = 16
+	H264_SCALING_LIST_8X8_LENGTH = 64
+)
+
+// https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/h264_sei.h
+const (
+	SEI_TYPE_BUFFERING_PERIOD       = 0   // buffering period (H.264 D.1.1)
+	SEI_TYPE_PIC_TIMING             = 1   // picture timing
+	SEI_TYPE_FILLER_PAYLOAD         = 3   // filler data
+	SEI_TYPE_USER_DATA_REGISTERED   = 4   // registered user data as specified by Rec. ITU-T T.35
+	SEI_TYPE_USER_DATA_UNREGISTERED = 5   // unregistered user data
+	SEI_TYPE_RECOVERY_POINT         = 6   // recovery point (frame # to decoder sync)
+	SEI_TYPE_FRAME_PACKING          = 45  // frame packing arrangement
+	SEI_TYPE_DISPLAY_ORIENTATION    = 47  // display orientation
+	SEI_TYPE_GREEN_METADATA         = 56  // GreenMPEG information
+	SEI_TYPE_ALTERNATIVE_TRANSFER   = 147 // alternative transfer
+)
+
+var (
+	// ISO 14496 part 10
+	// VUI parameters: Table E-1 "Meaning of sample aspect ratio
+	// indicator"
+	tableSarWidth = []int{0, 1, 12, 10, 16, 40, 24, 20, 32,
+		80, 18, 15, 64, 160, 4, 3, 2}
+	tableSarHeight = []int{0, 1, 11, 11, 11, 33, 11, 11, 11,
+		33, 11, 11, 33, 99, 3, 2, 1}
+)
+
 func IsDataNALU(b []byte) bool {
+	if len(b) < 1 {
+		return false
+	}
 	typ := b[0] & 0x1f
 	return typ >= 1 && typ <= 5
+}
+
+func NALUType(b []byte) byte {
+	if len(b) < 1 {
+		return NALU_UNSPECIFIED
+	}
+	return b[0] & 0x1f
 }
 
 /*
@@ -528,6 +568,13 @@ func ParseSPS(data []byte) (self SPSInfo, err error) {
 	self.Width = (self.MbWidth * 16) - self.CropLeft*2 - self.CropRight*2
 	self.Height = ((2 - frame_mbs_only_flag) * self.MbHeight * 16) - self.CropTop*2 - self.CropBottom*2
 
+	var vui_parameters_present_flag uint
+	if vui_parameters_present_flag, err = r.ReadBit(); err != nil {
+		return
+	}
+	if vui_parameters_present_flag != 0 {
+	}
+
 	return
 }
 
@@ -718,26 +765,40 @@ func (self SliceType) String() string {
 		return "B"
 	case SLICE_I:
 		return "I"
+	case SLICE_SP:
+		return "SP"
+	case SLICE_SI:
+		return "SI"
 	}
 	return ""
 }
 
 const (
-	SLICE_P = iota + 1
+	SLICE_P = iota
 	SLICE_B
 	SLICE_I
+	SLICE_SP
+	SLICE_SI
 )
 
-func ParseSliceHeaderFromNALU(packet []byte) (sliceType SliceType, err error) {
+type SliceHeader struct {
+	NalUnitType byte
+	NalRefIdc   byte
+	Type        SliceType
+}
 
+func ParseSliceHeaderFromNALU(packet []byte) (sliceHeader SliceHeader, err error) {
 	if len(packet) <= 1 {
 		err = fmt.Errorf("h264parser: packet too short to parse slice header")
 		return
 	}
 
 	nal_unit_type := packet[0] & 0x1f
+	nal_ref_idc := (packet[0] >> 5) & 0x3
 	switch nal_unit_type {
 	case 1, 2, 5, 19:
+		sliceHeader.NalUnitType = nal_unit_type
+		sliceHeader.NalRefIdc = nal_ref_idc
 		// slice_layer_without_partitioning_rbsp
 		// slice_data_partition_a_layer_rbsp
 
@@ -759,17 +820,61 @@ func ParseSliceHeaderFromNALU(packet []byte) (sliceType SliceType, err error) {
 		return
 	}
 
-	switch u {
-	case 0, 3, 5, 8:
-		sliceType = SLICE_P
-	case 1, 6:
-		sliceType = SLICE_B
-	case 2, 4, 7, 9:
-		sliceType = SLICE_I
-	default:
-		err = fmt.Errorf("h264parser: slice_type=%d invalid", u)
+	sliceHeader.Type = SliceType(u % 5)
+
+	return
+}
+
+type SEIMessage struct {
+	Type        uint
+	PayloadSize uint
+	Payload     []byte
+}
+
+func readLongUint(r *bits.GolombBitReader) (v uint, err error) {
+	var b uint
+	if b, err = r.ReadBits(8); err != nil {
+		return
+	}
+	for b == 255 {
+		v += b
+		if b, err = r.ReadBits(8); err != nil {
+			return
+		}
+	}
+	v += b
+	return
+}
+
+func ParseSEIMessageFromNALU(packet []byte) (sei SEIMessage, err error) {
+	if len(packet) <= 1 {
+		err = fmt.Errorf("h264parser: packet too short to parse slice header")
 		return
 	}
 
+	nal_unit_type := packet[0] & 0x1f
+	if nal_unit_type != NALU_SEI {
+		err = fmt.Errorf("h264parser: not SEI nalu")
+		return
+	}
+	br := bytes.NewReader(packet[1:])
+	r := &bits.GolombBitReader{R: br}
+	if sei.Type, err = readLongUint(r); err != nil {
+		return
+	}
+	if sei.PayloadSize, err = readLongUint(r); err != nil {
+		return
+	}
+	sei.Payload = make([]byte, br.Len())
+	n, _ := br.Read(sei.Payload)
+	if uint(n) < sei.PayloadSize {
+		err = fmt.Errorf("h264parser: SEI truncated to %d, expected %d", n, sei.PayloadSize)
+		return
+	}
+
+	return
+}
+
+func (self SEIMessage) Marshal(b []byte) (n int) {
 	return
 }

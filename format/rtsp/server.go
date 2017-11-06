@@ -149,11 +149,11 @@ func (self *Session) writeFLVH264Packet(pkt av.Packet) (err error) {
 		The NAL unit payload type as defined in table 7-1 of [1].
 	*/
 
-	if len(pkt.Data) < 5 {
+	if len(pkt.Data) < 1 {
 		return
 	}
 	// strip first 4 bytes for flv nalu size
-	data := pkt.Data[4:]
+	data := pkt.Data
 	// fmt.Println("write ", pkt.Idx, pkt.Time, len(pkt.Data))
 
 	nalFirst := data[0]
