@@ -12,6 +12,7 @@ import (
 	"github.com/nareix/joy4/codec/aacparser"
 	"github.com/nareix/joy4/codec/fake"
 	"github.com/nareix/joy4/codec/h264parser"
+	"github.com/nareix/joy4/codec/mp3parser"
 	"github.com/nareix/joy4/format/flv/flvio"
 )
 
@@ -143,10 +144,22 @@ func (self *Prober) PushTag(tag flvio.Tag, timestamp int32) (err error) {
 				self.GotAudio = true
 				self.CacheTag(tag, timestamp)
 			}
+		case flvio.SOUND_MP3:
+			if !self.GotAudio {
+				var stream mp3parser.CodecData
+				if stream, err = mp3parser.NewCodecDataFromMP3AudioConfigBytes(tag.Data); err != nil {
+					err = fmt.Errorf("flv: mp3 seqhdr invalid")
+					return
+				}
+				self.AudioStreamIdx = len(self.Streams)
+				self.Streams = append(self.Streams, stream)
+				self.GotAudio = true
+				self.CacheTag(tag, timestamp)
+			}
 		default:
 			if !self.GotAudio {
 				stream := fake.CodecData{
-					CodecType_: av.UNKNOWN,
+					CodecType_: av.AUDIO_UNKOWN,
 				}
 				self.AudioStreamIdx = len(self.Streams)
 				self.Streams = append(self.Streams, stream)

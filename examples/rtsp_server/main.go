@@ -37,11 +37,7 @@ func main() {
 	src.Close()
 	fmt.Printf("streams %+v\n", srcStreams)
 
-	server.HandlePublish = func(conn *rtsp.Conn, uri string) ([]av.CodecData, error) {
-		u, err := url.Parse(uri)
-		if err != nil {
-			return nil, err
-		}
+	server.HandlePublish = func(conn *rtsp.Conn, u *url.URL) ([]av.CodecData, error) {
 		if strings.HasPrefix(u.Path, "/test.flv") {
 			return srcStreams, nil
 		}

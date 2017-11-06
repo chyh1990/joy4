@@ -121,8 +121,10 @@ var (
 	PCM_ALAW   = MakeAudioCodecType(avCodecTypeMagic + 3)
 	SPEEX      = MakeAudioCodecType(avCodecTypeMagic + 4)
 	NELLYMOSER = MakeAudioCodecType(avCodecTypeMagic + 5)
+	MP3        = MakeAudioCodecType(avCodecTypeMagic + 6)
 
-	UNKNOWN = CodecType(0)
+	AUDIO_UNKOWN = MakeAudioCodecType(avCodecTypeMagic + 0)
+	VIDEO_UNKOWN = MakeVideoCodecType(avCodecTypeMagic + 0)
 )
 
 const codecTypeAudioBit = 0x1
@@ -130,8 +132,10 @@ const codecTypeOtherBits = 1
 
 func (self CodecType) String() string {
 	switch self {
-	case UNKNOWN:
-		return "UNKNOWN"
+	case AUDIO_UNKOWN:
+		return "AUDIO_UNKNOWN"
+	case VIDEO_UNKOWN:
+		return "VIDEO_UNKNOWN"
 	case H264:
 		return "H264"
 	case AAC:
@@ -144,6 +148,8 @@ func (self CodecType) String() string {
 		return "SPEEX"
 	case NELLYMOSER:
 		return "NELLYMOSER"
+	case MP3:
+		return "MP3"
 	}
 	return ""
 }

@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"net/textproto"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,8 +28,10 @@ type Server struct {
 	Addr         string
 	WriteTimeout time.Duration
 
-	HandlePublish func(*Conn, string) ([]av.CodecData, error)
+	HandlePublish func(*Conn, *url.URL) ([]av.CodecData, error)
 	HandlePlay    func(*Session) error
+
+	listener *net.TCPListener
 }
 
 type Conn struct {
@@ -58,7 +61,7 @@ const (
 )
 
 type Session struct {
-	Uri  string
+	Uri  *url.URL
 	Conn *Conn
 
 	event chan SessionEvent
@@ -273,11 +276,11 @@ func (self *Conn) writeStatus(code int, status string) {
 	})
 }
 
-func (self *Conn) publish(url string, headers textproto.MIMEHeader) ([]av.CodecData, error) {
+func (self *Conn) publish(uri *url.URL, headers textproto.MIMEHeader) ([]av.CodecData, error) {
 	var streams []av.CodecData
 	var err error
 	if self.server.HandlePublish != nil {
-		streams, err = self.server.HandlePublish(self, url)
+		streams, err = self.server.HandlePublish(self, uri)
 		if err != nil {
 			self.writeStatus(400, "Bad Request")
 			return nil, err
@@ -290,8 +293,8 @@ func (self *Conn) publish(url string, headers textproto.MIMEHeader) ([]av.CodecD
 	return streams, nil
 }
 
-func (self *Conn) doOptions(url string, headers textproto.MIMEHeader) error {
-	if _, err := self.publish(url, headers); err != nil {
+func (self *Conn) doOptions(uri *url.URL, headers textproto.MIMEHeader) error {
+	if _, err := self.publish(uri, headers); err != nil {
 		return err
 	}
 	self.writeStatus(200, "OK")
@@ -312,8 +315,8 @@ func sdpType(t av.CodecType) string {
 	return "unknown"
 }
 
-func (self *Conn) doDescribe(url string, headers textproto.MIMEHeader) error {
-	streams, err := self.publish(url, headers)
+func (self *Conn) doDescribe(uri *url.URL, headers textproto.MIMEHeader) error {
+	streams, err := self.publish(uri, headers)
 	if err != nil {
 		return err
 	}
@@ -357,7 +360,7 @@ func (self *Conn) doDescribe(url string, headers textproto.MIMEHeader) error {
 	lines := []string{
 		"RTSP/1.0 200 OK",
 		fmt.Sprintf("CSeq: %d", self.cseq),
-		fmt.Sprintf("Content-Base: %s/", url),
+		fmt.Sprintf("Content-Base: %s/", uri.String()),
 		"Content-Type: application/sdp",
 		fmt.Sprintf("Content-Length: %d", len(buf)),
 	}
@@ -369,9 +372,16 @@ func (self *Conn) doDescribe(url string, headers textproto.MIMEHeader) error {
 	return nil
 }
 
-func (self *Conn) doSetup(url string, headers textproto.MIMEHeader) error {
+func (self *Conn) doSetup(uri *url.URL, headers textproto.MIMEHeader) error {
+	qs := uri.Query()
+	idx := 0
+	if t, ok := qs["streamid"]; ok {
+		if len(t) > 0 {
+			idx, _ = strconv.Atoi(t[0])
+		}
+	}
 	// check
-	streams, err := self.publish(url, headers)
+	streams, err := self.publish(uri, headers)
 	if err != nil {
 		return err
 	}
@@ -383,7 +393,7 @@ func (self *Conn) doSetup(url string, headers textproto.MIMEHeader) error {
 		}
 	}
 	session := Session{
-		Uri:     url,
+		Uri:     uri,
 		Conn:    self,
 		event:   make(chan SessionEvent, 8),
 		session: sessionID,
@@ -397,8 +407,7 @@ func (self *Conn) doSetup(url string, headers textproto.MIMEHeader) error {
 		"RTSP/1.0 200 OK",
 		fmt.Sprintf("CSeq: %d", self.cseq),
 		fmt.Sprintf("Session: %s", sessionID),
-		// TODO stream id
-		fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d", 0, 1),
+		fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d", idx, idx+1),
 	}
 	self.writeResponse(response{
 		lines: lines,
@@ -421,7 +430,7 @@ func (self *Conn) findSession(headers textproto.MIMEHeader) *Session {
 	return session
 }
 
-func (self *Conn) doPlay(url string, headers textproto.MIMEHeader) (err error) {
+func (self *Conn) doPlay(uri *url.URL, headers textproto.MIMEHeader) (err error) {
 	session := self.findSession(headers)
 	if session == nil {
 		self.writeStatus(400, "Bad Request")
@@ -441,7 +450,7 @@ func (self *Conn) doPlay(url string, headers textproto.MIMEHeader) (err error) {
 	return
 }
 
-func (self *Conn) doTeardown(url string, headers textproto.MIMEHeader) (err error) {
+func (self *Conn) doTeardown(uri *url.URL, headers textproto.MIMEHeader) (err error) {
 	session := self.findSession(headers)
 	if session == nil {
 		self.writeStatus(400, "Bad Request")
@@ -456,14 +465,20 @@ func (self *Conn) doTeardown(url string, headers textproto.MIMEHeader) (err erro
 }
 
 func (self *Conn) dispatch(line string) error {
-	var cmd, url, proto string
-	n, err := fmt.Sscanf(line, "%s %s %s", &cmd, &url, &proto)
+	var cmd, raw, proto string
+	n, err := fmt.Sscanf(line, "%s %s %s", &cmd, &raw, &proto)
 	if err != nil {
 		return err
 	}
 	if n != 3 || proto != "RTSP/1.0" {
 		return errors.New("invalid request")
 	}
+	uri, err := url.Parse(raw)
+	if err != nil {
+		self.writeStatus(400, "Bad Request")
+		return nil
+	}
+
 	headers, err := self.textconn.ReadMIMEHeader()
 	if err != nil {
 		return err
@@ -484,15 +499,15 @@ func (self *Conn) dispatch(line string) error {
 
 	switch cmd {
 	case "OPTIONS":
-		err = self.doOptions(url, headers)
+		err = self.doOptions(uri, headers)
 	case "DESCRIBE":
-		err = self.doDescribe(url, headers)
+		err = self.doDescribe(uri, headers)
 	case "SETUP":
-		err = self.doSetup(url, headers)
+		err = self.doSetup(uri, headers)
 	case "PLAY":
-		err = self.doPlay(url, headers)
+		err = self.doPlay(uri, headers)
 	case "TEARDOWN":
-		err = self.doTeardown(url, headers)
+		err = self.doTeardown(uri, headers)
 	default:
 		self.writeStatus(400, "Bad Request")
 	}
@@ -562,6 +577,7 @@ func (self *Conn) readLoop() error {
 	var line string
 	for {
 		line, err = self.textconn.ReadLine()
+		fmt.Println(line)
 		if err != nil {
 			break
 		}
@@ -603,6 +619,7 @@ func (self *Server) ListenAndServe() (err error) {
 	if listener, err = net.ListenTCP("tcp", tcpaddr); err != nil {
 		return
 	}
+	self.listener = listener
 
 	if Debug {
 		fmt.Println("rtsp: server: listening on", addr)
@@ -611,6 +628,7 @@ func (self *Server) ListenAndServe() (err error) {
 	for {
 		var netconn net.Conn
 		if netconn, err = listener.Accept(); err != nil {
+			fmt.Println("rtsp: server: ", err)
 			return
 		}
 
@@ -627,4 +645,11 @@ func (self *Server) ListenAndServe() (err error) {
 			}
 		}()
 	}
+}
+
+func (self *Server) Close() (err error) {
+	if self.listener == nil {
+		return nil
+	}
+	return self.listener.Close()
 }
