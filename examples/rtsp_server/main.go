@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/av/avutil"
+	"github.com/nareix/joy4/codec/h264parser"
 	"github.com/nareix/joy4/format"
 	"github.com/nareix/joy4/format/rtsp"
 )
@@ -56,7 +58,6 @@ func main() {
 			var err error
 
 			<-session.Events()
-
 			for session.IsPlaying() {
 				var pkt av.Packet
 				if pkt, err = src.ReadPacket(); err != nil {
@@ -65,12 +66,26 @@ func main() {
 						break
 					}
 				}
-				if err = session.WritePacket(pkt); err != nil {
-					break
+				if pkt.Idx == 0 && len(pkt.Data) > 4 {
+					nalus, _ := h264parser.SplitNALUs(pkt.Data)
+					for _, nal := range nalus {
+						switch h264parser.NALUType(nal) {
+						case h264parser.NALU_IDR_SLICE, h264parser.NALU_NON_IDR_SLICE:
+							header, _ := h264parser.ParseSliceHeaderFromNALU(nal)
+							fmt.Println("frame: ", pkt.IsKeyFrame, header)
+						case h264parser.NALU_SEI:
+							sei, _ := h264parser.ParseSEIMessageFromNALU(nal)
+							fmt.Println("SEI: ", sei.Type, sei.PayloadSize)
+							fmt.Print(hex.Dump(sei.Payload))
+						}
+						pkt.Data = nal
+						if err = session.WritePacket(pkt); err != nil {
+							break
+						}
+					}
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-
 			fmt.Println("done: ", err)
 		}()
 		return nil
