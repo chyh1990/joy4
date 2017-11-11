@@ -19,6 +19,7 @@ import (
 
 	"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/av/avutil"
+	"github.com/nareix/joy4/format/rtsp/rtp"
 	"github.com/nareix/joy4/format/rtsp/sdp"
 )
 
@@ -127,7 +128,7 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 		DebugRtp:   DebugRtp,
 		DebugRtsp:  DebugRtsp,
 
-		udpCh: make(chan udpPacket, 32),
+		udpCh: make(chan udpPacket, 100),
 	}
 	return
 }
@@ -744,9 +745,8 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 	_, blockno, _, _, _ := self.parseBlockHeader(block)
 	if blockno%2 != 0 {
 		if self.DebugRtp {
-			fmt.Println("rtsp: rtcp block len", len(block)-4)
+			fmt.Println("rtsp: rtcp block len", len(block)-4, "no", blockno)
 		}
-		return
 	}
 
 	i := blockno / 2
@@ -772,27 +772,33 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 		}
 	*/
 
-	p, more := stream.ctx.RtpParsePacket(block[4:])
-	if p == nil {
+	var more bool
+	pkt, more, err = stream.ctx.RtpParsePacket(block[4:])
+	if err == rtp.ErrNoPacket {
+		err = nil
 		return
 	}
-	if p != nil {
-		pkt = *p
-		ok = true
+	if err != nil {
+		return
 	}
-	pkt.Idx = int8(i)
+
 	self.more = more
 	if more {
 		self.moreStreamIdx = i
 	}
 
+	ok = true
+	pkt.Idx = int8(i)
+
 	if self.DebugRtp {
-		fmt.Println("rtp: packet len:", len(pkt.Data), "stream:", i, "time:", pkt.Time, "more:", more)
-		l := 32
-		if l > len(pkt.Data) {
-			l = len(pkt.Data)
-		}
-		fmt.Print(hex.Dump(pkt.Data[:l]))
+		// fmt.Println("rtp: packet len:", len(pkt.Data), "stream:", i, "time:", pkt.Time, "more:", more)
+		/*
+			l := 32
+			if l > len(pkt.Data) {
+				l = len(pkt.Data)
+			}
+			fmt.Print(hex.Dump(pkt.Data[:l]))
+		*/
 	}
 
 	return
@@ -820,9 +826,9 @@ func (self *Client) readUDPPacket() (pkt av.Packet, err error) {
 			}
 			p.Timestamp = timestamp
 			p.Sequence = seq
-			if self.DebugRtp {
-				fmt.Println("rtp: ", p.Timestamp, p.Sequence)
-			}
+			// if self.DebugRtp {
+			// 	fmt.Println("rtp: ", p.Timestamp, p.Sequence)
+			// }
 			if pkt, ok, err = self.handleBlock(p.Data); err != nil {
 				fmt.Println("rtsp: bad block: ", err)
 				return
@@ -866,11 +872,13 @@ func (self *Client) readPacket() (pkt av.Packet, err error) {
 		return
 	}
 
-	if self.more {
-		p, more := self.streams[self.moreStreamIdx].ctx.RtpParsePacket(nil)
-		self.more = more
-		if p != nil {
-			pkt = *p
+	for self.more {
+		pkt, self.more, err = self.streams[self.moreStreamIdx].ctx.RtpParsePacket(nil)
+		if err == rtp.ErrNoPacket {
+			err = nil
+		} else if err != nil {
+			return
+		} else {
 			return
 		}
 	}

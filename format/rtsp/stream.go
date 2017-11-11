@@ -33,7 +33,7 @@ func (self *Stream) setupUDP() (err error) {
 		return
 	}
 	go self.readUDP(0)
-	// go self.readUDP(1)
+	go self.readUDP(1)
 	if self.client.DebugRtsp {
 		fmt.Println("rtsp: stream", self.Idx, ": rtp-rtcp: ",
 			self.udpConns[0].LocalAddr(), self.udpConns[1].LocalAddr())
@@ -50,7 +50,7 @@ func (self *Stream) readUDP(idx int) {
 			break
 		}
 		b[0] = '$'
-		b[1] = byte(idx)
+		b[1] = byte(self.Idx*2 + idx)
 		binary.BigEndian.PutUint16(b[2:4], uint16(n))
 
 		out := make([]byte, 4+n)
@@ -62,7 +62,7 @@ func (self *Stream) readUDP(idx int) {
 		}:
 		default:
 			if self.client.DebugRtp {
-				fmt.Println("drop udp packet")
+				fmt.Println("rtp: drop udp packet")
 			}
 		}
 	}

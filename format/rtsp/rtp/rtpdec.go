@@ -2,7 +2,9 @@ package rtp
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -79,6 +81,8 @@ const (
 
 const AV_NOPTS_VALUE = 0
 const AV_TIME_BASE = int64(time.Millisecond)
+
+var ErrNoPacket = errors.New("no rtp packet")
 
 func relativeTime() int64 {
 	return time.Now().UnixNano() / AV_TIME_BASE
@@ -223,13 +227,11 @@ func (s *RTPDemuxContext) finalizePacket(pkt *av.Packet, timestamp uint32) {
 	if timestamp == RTP_NOTS_VALUE {
 		return
 	}
-	if s.lastRtcpNtpTime != AV_NOPTS_VALUE /* &&  s->ic->nb_streams > 1 */ {
-		added := int64(0)
+	if s.lastRtcpNtpTime != AV_NOPTS_VALUE && s.TimeScale > 0 {
+		/* compute pts from timestamp with received ntp_time */
 		deltaTimestamp := int64(int32(timestamp - s.lastRtcpTimestamp))
-		// TODO
-		// pkt->pts = s->range_start_offset + s->rtcp_ts_offset + addend +
-		//                    delta_timestamp;
-		pkt.Time = time.Duration(s.rangeStartOffset+s.rtcpTsOffset+added+deltaTimestamp) * time.Millisecond
+		added := ((s.lastRtcpNtpTime - s.firstRtcpNtpTime) * int64(s.TimeScale)) / (1 << 32)
+		pkt.Time = time.Duration(s.rangeStartOffset+s.rtcpTsOffset+added+deltaTimestamp) * time.Second / time.Duration(s.TimeScale)
 		return
 	}
 	if s.baseTimestamp == 0 {
@@ -244,12 +246,7 @@ func (s *RTPDemuxContext) finalizePacket(pkt *av.Packet, timestamp uint32) {
 	}
 	// fmt.Println("TS: ", s.timestamp, timestamp, (int32)(timestamp-s.timestamp))
 	s.timestamp = timestamp
-	// TODO
-	/*
-		pkt->pts     = s->unwrapped_timestamp + s->range_start_offset -
-		                   s->base_timestamp;
-	*/
-	if s.TimeScale != 0 {
+	if s.TimeScale > 0 {
 		pkt.Time = time.Duration(s.unwrappedTimestamp+s.rangeStartOffset-int64(s.baseTimestamp)) * time.Second / time.Duration(s.TimeScale)
 	} else {
 		fmt.Println("rtp: timescale unavailble, not packet time")
@@ -382,6 +379,36 @@ func (s *RTPDemuxContext) hasNextPacket() bool {
 }
 
 func (s *RTPDemuxContext) rtcpParsePacket(buf []byte) int {
+	for len(buf) >= 4 {
+		payloadLen := (int(binary.BigEndian.Uint16(buf[2:])) + 1) * 4
+		if payloadLen > len(buf) {
+			payloadLen = len(buf)
+		}
+
+		switch buf[1] {
+		case RTCP_SR:
+			if payloadLen < 20 {
+				fmt.Println("Invalid RTCP SR packet length")
+				return -1
+			}
+			s.lastRtcpReceptionTime = relativeTime()
+			s.lastRtcpNtpTime = int64(binary.BigEndian.Uint64(buf[8:]))
+			s.lastRtcpTimestamp = binary.BigEndian.Uint32(buf[16:])
+			// fmt.Println("XX", s.lastRtcpNtpTime, s.lastRtcpTimestamp)
+			if s.firstRtcpNtpTime == AV_NOPTS_VALUE {
+				s.firstRtcpNtpTime = s.lastRtcpNtpTime
+				if s.baseTimestamp == 0 {
+					s.baseTimestamp = s.lastRtcpTimestamp
+				}
+				s.rtcpTsOffset = int64(int32(s.lastRtcpTimestamp - s.baseTimestamp))
+			}
+		case RTCP_BYE:
+			// XXX should be error code
+			return -1
+		}
+		buf = buf[payloadLen:]
+
+	}
 	return -1
 }
 
@@ -462,7 +489,7 @@ func (s *RTPDemuxContext) rtpParseOnePacket(pkt *av.Packet, buf []byte) int {
 // return 0 if a packet is returned, 1 if a packet is returned and more can
 // follow (use buf as NULL to read the next). -1 if no packet (error or no more
 // packet).
-func (s *RTPDemuxContext) RtpParsePacket(buf []byte) (*av.Packet, bool) {
+func (s *RTPDemuxContext) RtpParsePacket(buf []byte) (av.Packet, bool, error) {
 	var pkt av.Packet
 	rv := s.rtpParseOnePacket(&pkt, buf)
 	s.prevRet = rv
@@ -470,11 +497,13 @@ func (s *RTPDemuxContext) RtpParsePacket(buf []byte) (*av.Packet, bool) {
 		rv = s.rtpParseQueuedPacket(&pkt)
 	}
 	if rv > 0 {
-		return &pkt, true
+		return pkt, true, nil
 	} else if rv == 0 {
-		return &pkt, false
+		return pkt, false, nil
+	} else if rv == -1 {
+		return pkt, false, ErrNoPacket
 	} else {
-		return nil, false
+		return pkt, false, io.EOF
 	}
 }
 
