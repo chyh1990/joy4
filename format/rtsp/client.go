@@ -610,8 +610,13 @@ func (self *Client) Setup() (err error) {
 		if err = self.WriteRequest(req); err != nil {
 			return
 		}
-		if _, err = self.ReadResponse(); err != nil {
+		var resp Response
+		if resp, err = self.ReadResponse(); err != nil {
 			return
+		}
+
+		if self.UseUDP {
+			self.streams[si].sendPunch(self.requestUri, &resp)
 		}
 	}
 
@@ -791,14 +796,12 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 	pkt.Idx = int8(i)
 
 	if self.DebugRtp {
-		// fmt.Println("rtp: packet len:", len(pkt.Data), "stream:", i, "time:", pkt.Time, "more:", more)
-		/*
-			l := 32
-			if l > len(pkt.Data) {
-				l = len(pkt.Data)
-			}
-			fmt.Print(hex.Dump(pkt.Data[:l]))
-		*/
+		fmt.Println("rtp: packet len:", len(pkt.Data), "stream:", i, "time:", pkt.Time, "more:", more)
+		l := 32
+		if l > len(pkt.Data) {
+			l = len(pkt.Data)
+		}
+		fmt.Print(hex.Dump(pkt.Data[:l]))
 	}
 
 	return

@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/url"
+	"strings"
 
 	"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/format/rtsp/rtp"
@@ -39,6 +41,36 @@ func (self *Stream) setupUDP() (err error) {
 			self.udpConns[0].LocalAddr(), self.udpConns[1].LocalAddr())
 	}
 	return nil
+}
+
+func (self *Stream) sendPunchInternal(host string, idx int, port int) {
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		return
+	}
+	for i := 0; i < 3; i++ {
+		self.udpConns[idx].WriteToUDP([]byte{0x00, 0x00, 0x00, 0x00}, udpAddr)
+	}
+}
+
+func (self *Stream) sendPunch(uri string, resp *Response) {
+	if len(self.udpConns) == 0 {
+		return
+	}
+
+	url, perr := url.Parse(uri)
+	if perr != nil {
+		return
+	}
+	transport := resp.Headers.Get("Transport")
+	for _, e := range strings.Split(transport, ";") {
+		var spMin, spMax int
+		n, _ := fmt.Sscanf(e, "server_port=%d-%d", &spMin, &spMax)
+		if n == 2 {
+			self.sendPunchInternal(url.Hostname(), 0, spMin)
+			self.sendPunchInternal(url.Hostname(), 1, spMax)
+		}
+	}
 }
 
 func (self *Stream) readUDP(idx int) {

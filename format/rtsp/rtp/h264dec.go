@@ -144,7 +144,6 @@ func (h *H264DynamicProtocol) ParsePacket(pkt *av.Packet, buf []byte, timestamp 
 	case naltype >= 9 && naltype <= 23:
 		fallthrough
 	case naltype >= 1 && naltype <= 8:
-		// fmt.Println("nal", naltype)
 		// isSEI := naltype == h264parser.NALU_SEI
 		isKeyFrame := naltype == h264parser.NALU_IDR_SLICE
 		// avcc mode
@@ -157,6 +156,7 @@ func (h *H264DynamicProtocol) ParsePacket(pkt *av.Packet, buf []byte, timestamp 
 	case naltype == 28: // FU-A (fragmented nal)
 		rv = h.parseFUAPacket(pkt, buf, NAL_MASK)
 	default:
+		fmt.Println("rtp: unknown nal type", naltype)
 		return timestamp, -1
 	}
 
