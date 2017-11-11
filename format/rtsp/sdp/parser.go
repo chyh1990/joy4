@@ -1,12 +1,11 @@
 package sdp
 
 import (
-	"encoding/base64"
 	"encoding/hex"
-	"fmt"
-	"github.com/nareix/joy4/av"
 	"strconv"
 	"strings"
+
+	"github.com/nareix/joy4/av"
 )
 
 type Session struct {
@@ -14,16 +13,18 @@ type Session struct {
 }
 
 type Media struct {
-	AVType             string
-	Type               av.CodecType
-	TimeScale          int
-	Control            string
-	Rtpmap             int
-	Config             []byte
-	SpropParameterSets [][]byte
-	PayloadType        int
-	SizeLength         int
-	IndexLength        int
+	AVType      string
+	Type        av.CodecType
+	TimeScale   int
+	Control     string
+	Rtpmap      int
+	Config      []byte
+	PayloadType int
+	SizeLength  int
+	IndexLength int
+
+	ALines map[string]string
+	// SpropParameterSets [][]byte
 }
 
 func Parse(content string) (sess Session, medias []Media) {
@@ -40,7 +41,7 @@ func Parse(content string) (sess Session, medias []Media) {
 				if len(fields) > 0 {
 					switch fields[0] {
 					case "audio", "video":
-						medias = append(medias, Media{AVType: fields[0]})
+						medias = append(medias, Media{AVType: fields[0], ALines: make(map[string]string)})
 						media = &medias[len(medias)-1]
 						mfields := strings.Split(fields[1], " ")
 						if len(mfields) >= 3 {
@@ -78,9 +79,6 @@ func Parse(content string) (sess Session, medias []Media) {
 							if i, err := strconv.Atoi(keyval[1]); err == nil {
 								media.TimeScale = i
 							}
-							if false {
-								fmt.Println("sdp:", keyval[1], media.TimeScale)
-							}
 						}
 						keyval = strings.Split(field, ";")
 						if len(keyval) > 1 {
@@ -96,12 +94,8 @@ func Parse(content string) (sess Session, medias []Media) {
 										media.SizeLength, _ = strconv.Atoi(val)
 									case "indexlength":
 										media.IndexLength, _ = strconv.Atoi(val)
-									case "sprop-parameter-sets":
-										fields := strings.Split(val, ",")
-										for _, field := range fields {
-											val, _ := base64.StdEncoding.DecodeString(field)
-											media.SpropParameterSets = append(media.SpropParameterSets, val)
-										}
+									default:
+										media.ALines[key] = val
 									}
 								}
 							}

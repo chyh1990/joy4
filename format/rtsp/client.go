@@ -16,12 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nareix/bits/pio"
 	"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/av/avutil"
-	"github.com/nareix/joy4/codec"
-	"github.com/nareix/joy4/codec/aacparser"
-	"github.com/nareix/joy4/codec/h264parser"
 	"github.com/nareix/joy4/format/rtsp/sdp"
 )
 
@@ -29,7 +25,6 @@ var ErrCodecDataChange = fmt.Errorf("rtsp: codec data change, please call Handle
 
 var DebugRtp = false
 var DebugRtsp = false
-var SkipErrRtpBlock = false
 
 const (
 	stageDescribeDone = iota + 1
@@ -38,35 +33,48 @@ const (
 	stageCodecDataDone
 )
 
+type udpPacket struct {
+	Idx  int
+	Data []byte
+
+	Timestamp uint32
+	Sequence  uint16
+}
+
 type Client struct {
 	DebugRtsp bool
 	DebugRtp  bool
 	Headers   []string
 
-	SkipErrRtpBlock bool
-
-	RtspTimeout          time.Duration
-	RtpTimeout           time.Duration
-	RtpKeepAliveTimeout  time.Duration
-	rtpKeepaliveTimer    time.Time
-	rtpKeepaliveEnterCnt int
+	RtspTimeout         time.Duration
+	RtpTimeout          time.Duration
+	RtpKeepAliveTimeout time.Duration
+	rtpKeepaliveTimer   time.Time
+	// rtpKeepaliveEnterCnt int
 
 	stage int
 
-	setupIdx []int
-	setupMap []int
+	// setupIdx []int
+	// setupMap []int
 
 	authHeaders func(method string) []string
 
-	url         *url.URL
-	conn        *connWithTimeout
-	brconn      *bufio.Reader
-	requestUri  string
-	cseq        uint
-	streams     []*Stream
-	streamsintf []av.CodecData
-	session     string
-	body        io.Reader
+	url        *url.URL
+	conn       *connWithTimeout
+	brconn     *bufio.Reader
+	requestUri string
+	cseq       uint
+	streams    []*Stream
+	session    string
+	body       io.Reader
+
+	// UDP
+	UseUDP bool
+	udpCh  chan udpPacket
+
+	// more packets
+	more          bool
+	moreStreamIdx int
 }
 
 type Request struct {
@@ -106,13 +114,14 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 	connt := &connWithTimeout{Conn: conn}
 
 	self = &Client{
-		conn:            connt,
-		brconn:          bufio.NewReaderSize(connt, 256),
-		url:             URL,
-		requestUri:      u2.String(),
-		DebugRtp:        DebugRtp,
-		DebugRtsp:       DebugRtsp,
-		SkipErrRtpBlock: SkipErrRtpBlock,
+		conn:       connt,
+		brconn:     bufio.NewReaderSize(connt, 256),
+		url:        URL,
+		requestUri: u2.String(),
+		DebugRtp:   DebugRtp,
+		DebugRtsp:  DebugRtsp,
+
+		udpCh: make(chan udpPacket, 32),
 	}
 	return
 }
@@ -122,9 +131,8 @@ func Dial(uri string) (self *Client, err error) {
 }
 
 func (self *Client) allCodecDataReady() bool {
-	for _, si := range self.setupIdx {
-		stream := self.streams[si]
-		if stream.CodecData == nil {
+	for _, s := range self.streams {
+		if s.CodecData == nil {
 			return false
 		}
 	}
@@ -175,9 +183,8 @@ func (self *Client) Streams() (streams []av.CodecData, err error) {
 	if err = self.prepare(stageCodecDataDone); err != nil {
 		return
 	}
-	for _, si := range self.setupIdx {
-		stream := self.streams[si]
-		streams = append(streams, stream.CodecData)
+	for _, s := range self.streams {
+		streams = append(streams, s.CodecData)
 	}
 	return
 }
@@ -242,7 +249,7 @@ func (self *Client) WriteRequest(req Request) (err error) {
 	return
 }
 
-func (self *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) {
+func (self *Client) parseBlockHeader(h []byte) (length int, no int, timestamp uint32, seq uint16, valid bool) {
 	length = int(h[2])<<8 + int(h[3])
 	no = int(h[1])
 	if no/2 >= len(self.streams) {
@@ -264,15 +271,8 @@ func (self *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) 
 			return
 		}
 
-		timestamp := binary.BigEndian.Uint32(h[8:12])
-		if stream.firsttimestamp != 0 {
-			timestamp -= stream.firsttimestamp
-			if timestamp < stream.timestamp {
-				return
-			} else if timestamp-stream.timestamp > uint32(stream.timeScale()*60*60) {
-				return
-			}
-		}
+		seq = binary.BigEndian.Uint16(h[6:8])
+		timestamp = binary.BigEndian.Uint32(h[8:12])
 	} else { // rtcp
 	}
 
@@ -432,7 +432,7 @@ func (self *Client) findRTSP() (block []byte, data []byte, err error) {
 			if self.DebugRtp {
 				fmt.Println("rtsp: dollar at", i, len(peek))
 			}
-			if blocklen, _, ok := self.parseBlockHeader(peek); ok {
+			if blocklen, _, _, _, ok := self.parseBlockHeader(peek); ok {
 				left := blocklen + 4 - len(peek)
 				block = append(peek, make([]byte, left)...)
 				if _, err = io.ReadFull(self.brconn, block[len(peek):]); err != nil {
@@ -487,7 +487,7 @@ func (self *Client) readLFLF() (block []byte, data []byte, err error) {
 		} else if dollarpos != -1 && dollarpos-pos >= 12 {
 			hdrlen := dollarpos - pos
 			start := len(peek) - hdrlen
-			if blocklen, _, ok := self.parseBlockHeader(peek[start:]); ok {
+			if blocklen, _, _, _, ok := self.parseBlockHeader(peek[start:]); ok {
 				block = append(peek[start:], make([]byte, blocklen+4-hdrlen)...)
 				if _, err = io.ReadFull(self.brconn, block[hdrlen:]); err != nil {
 					return
@@ -564,27 +564,15 @@ func (self *Client) ReadResponse() (res Response, err error) {
 }
 
 func (self *Client) SetupAll() (err error) {
-	idx := []int{}
-	for i := range self.streams {
-		idx = append(idx, i)
-	}
-	return self.Setup(idx)
+	return self.Setup()
 }
 
-func (self *Client) Setup(idx []int) (err error) {
+func (self *Client) Setup() (err error) {
 	if err = self.prepare(stageDescribeDone); err != nil {
 		return
 	}
 
-	self.setupMap = make([]int, len(self.streams))
-	for i := range self.setupMap {
-		self.setupMap[i] = -1
-	}
-	self.setupIdx = idx
-
-	for i, si := range idx {
-		self.setupMap[si] = i
-
+	for si := range self.streams {
 		uri := ""
 		control := self.streams[si].Sdp.Control
 		if strings.HasPrefix(control, "rtsp://") {
@@ -593,7 +581,17 @@ func (self *Client) Setup(idx []int) (err error) {
 			uri = self.requestUri + "/" + control
 		}
 		req := Request{Method: "SETUP", Uri: uri}
-		req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d", si*2, si*2+1))
+		if self.UseUDP {
+			err = self.streams[si].setupUDP()
+			if err != nil {
+				return
+			}
+			p1 := self.streams[si].rtpUdpPort()
+			p2 := self.streams[si].rtcpUdpPort()
+			req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP;unicast;client_port=%d-%d", p1, p2))
+		} else {
+			req.Header = append(req.Header, fmt.Sprintf("Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d", si*2, si*2+1))
+		}
 		if self.session != "" {
 			req.Header = append(req.Header, "Session: "+self.session)
 		}
@@ -649,11 +647,15 @@ func (self *Client) Describe() (streams []sdp.Media, err error) {
 	_, medias := sdp.Parse(body)
 
 	self.streams = []*Stream{}
-	for _, media := range medias {
-		stream := &Stream{Sdp: media, client: self}
+	for i, media := range medias {
+		stream := &Stream{Sdp: media, client: self, Idx: i}
 		if err := stream.makeCodecData(); err != nil {
 			fmt.Println("warn: stream error: ", err, media)
 			continue
+		}
+
+		if self.DebugRtsp {
+			fmt.Printf("rtsp: stream %d: %+v\n", i, stream)
 		}
 		self.streams = append(self.streams, stream)
 		streams = append(streams, media)
@@ -682,428 +684,6 @@ func (self *Client) Options() (err error) {
 	return
 }
 
-func (self *Client) HandleCodecDataChange() (_newcli *Client, err error) {
-	newcli := &Client{}
-	*newcli = *self
-
-	newcli.streams = []*Stream{}
-	for _, stream := range self.streams {
-		newstream := &Stream{}
-		*newstream = *stream
-		newstream.client = newcli
-
-		if newstream.isCodecDataChange() {
-			if err = newstream.makeCodecData(); err != nil {
-				return
-			}
-			newstream.clearCodecDataChange()
-		}
-		newcli.streams = append(newcli.streams, newstream)
-	}
-
-	_newcli = newcli
-	return
-}
-
-func (self *Stream) clearCodecDataChange() {
-	self.spsChanged = false
-	self.ppsChanged = false
-}
-
-func (self *Stream) isCodecDataChange() bool {
-	if self.spsChanged && self.ppsChanged {
-		return true
-	}
-	return false
-}
-
-func (self *Stream) timeScale() int {
-	t := self.Sdp.TimeScale
-	if t == 0 {
-		// https://tools.ietf.org/html/rfc5391
-		t = 8000
-	}
-	return t
-}
-
-func (self *Stream) makeCodecData() (err error) {
-	media := self.Sdp
-
-	if media.PayloadType >= 96 && media.PayloadType <= 127 {
-		switch media.Type {
-		case av.H264:
-			for _, nalu := range media.SpropParameterSets {
-				if len(nalu) > 0 {
-					self.handleH264Payload(0, nalu)
-				}
-			}
-
-			if len(self.sps) == 0 || len(self.pps) == 0 {
-				if nalus, typ := h264parser.SplitNALUs(media.Config); typ != h264parser.NALU_RAW {
-					for _, nalu := range nalus {
-						if len(nalu) > 0 {
-							self.handleH264Payload(0, nalu)
-						}
-					}
-				}
-			}
-
-			if len(self.sps) > 0 && len(self.pps) > 0 {
-				if self.CodecData, err = h264parser.NewCodecDataFromSPSAndPPS(self.sps, self.pps); err != nil {
-					err = fmt.Errorf("rtsp: h264 sps/pps invalid: %s", err)
-					return
-				}
-			} else {
-				err = fmt.Errorf("rtsp: missing h264 sps or pps")
-				return
-			}
-
-		case av.AAC:
-			if len(media.Config) == 0 {
-				err = fmt.Errorf("rtsp: aac sdp config missing")
-				return
-			}
-			if self.CodecData, err = aacparser.NewCodecDataFromMPEG4AudioConfigBytes(media.Config); err != nil {
-				err = fmt.Errorf("rtsp: aac sdp config invalid: %s", err)
-				return
-			}
-		}
-	} else {
-		switch media.PayloadType {
-		case 0:
-			self.CodecData = codec.NewPCMMulawCodecData()
-
-		case 8:
-			self.CodecData = codec.NewPCMAlawCodecData()
-
-		default:
-			err = fmt.Errorf("rtsp: PayloadType=%d unsupported", media.PayloadType)
-			return
-		}
-	}
-
-	return
-}
-
-func (self *Stream) handleBuggyAnnexbH264Packet(timestamp uint32, packet []byte) (isBuggy bool, err error) {
-	if len(packet) >= 4 && packet[0] == 0 && packet[1] == 0 && packet[2] == 0 && packet[3] == 1 {
-		isBuggy = true
-		if nalus, typ := h264parser.SplitNALUs(packet); typ != h264parser.NALU_RAW {
-			for _, nalu := range nalus {
-				if len(nalu) > 0 {
-					if err = self.handleH264Payload(timestamp, nalu); err != nil {
-						return
-					}
-				}
-			}
-		}
-	}
-	return
-}
-
-func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err error) {
-	if len(packet) < 2 {
-		err = fmt.Errorf("rtp: h264 packet too short")
-		return
-	}
-
-	var isBuggy bool
-	if isBuggy, err = self.handleBuggyAnnexbH264Packet(timestamp, packet); isBuggy {
-		return
-	}
-
-	naluType := packet[0] & 0x1f
-
-	/*
-		Table 7-1 – NAL unit type codes
-		1   ￼Coded slice of a non-IDR picture
-		5    Coded slice of an IDR picture
-		6    Supplemental enhancement information (SEI)
-		7    Sequence parameter set
-		8    Picture parameter set
-		1-23     NAL unit  Single NAL unit packet             5.6
-		24       STAP-A    Single-time aggregation packet     5.7.1
-		25       STAP-B    Single-time aggregation packet     5.7.1
-		26       MTAP16    Multi-time aggregation packet      5.7.2
-		27       MTAP24    Multi-time aggregation packet      5.7.2
-		28       FU-A      Fragmentation unit                 5.8
-		29       FU-B      Fragmentation unit                 5.8
-		30-31    reserved                                     -
-	*/
-	switch {
-	case naluType >= 1 && naluType <= 6:
-		if naluType == 5 {
-			self.pkt.IsKeyFrame = true
-		}
-		self.gotpkt = true
-		// raw nalu to avcc
-		b := make([]byte, 4+len(packet))
-		pio.PutU32BE(b[0:4], uint32(len(packet)))
-		copy(b[4:], packet)
-		// sei nalu
-		if naluType == 6 {
-			self.pkt.ExtraData = b
-		} else {
-			self.pkt.Data = b
-		}
-		self.timestamp = timestamp
-	case naluType == 7: // sps
-		if self.client != nil && self.client.DebugRtp {
-			fmt.Println("rtsp: got sps")
-		}
-		if len(self.sps) == 0 {
-			self.sps = packet
-			self.makeCodecData()
-		} else if bytes.Compare(self.sps, packet) != 0 {
-			self.spsChanged = true
-			self.sps = packet
-			if self.client != nil && self.client.DebugRtp {
-				fmt.Println("rtsp: sps changed")
-			}
-		}
-
-	case naluType == 8: // pps
-		if self.client != nil && self.client.DebugRtp {
-			fmt.Println("rtsp: got pps")
-		}
-		if len(self.pps) == 0 {
-			self.pps = packet
-			self.makeCodecData()
-		} else if bytes.Compare(self.pps, packet) != 0 {
-			self.ppsChanged = true
-			self.pps = packet
-			if self.client != nil && self.client.DebugRtp {
-				fmt.Println("rtsp: pps changed")
-			}
-		}
-
-	case naluType == 28: // FU-A
-		/*
-			0                   1                   2                   3
-			0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			| FU indicator  |   FU header   |                               |
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               |
-			|                                                               |
-			|                         FU payload                            |
-			|                                                               |
-			|                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|                               :...OPTIONAL RTP padding        |
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			Figure 14.  RTP payload format for FU-A
-
-			The FU indicator octet has the following format:
-			+---------------+
-			|0|1|2|3|4|5|6|7|
-			+-+-+-+-+-+-+-+-+
-			|F|NRI|  Type   |
-			+---------------+
-
-
-			The FU header has the following format:
-			+---------------+
-			|0|1|2|3|4|5|6|7|
-			+-+-+-+-+-+-+-+-+
-			|S|E|R|  Type   |
-			+---------------+
-
-			S: 1 bit
-			When set to one, the Start bit indicates the start of a fragmented
-			NAL unit.  When the following FU payload is not the start of a
-			fragmented NAL unit payload, the Start bit is set to zero.
-
-			E: 1 bit
-			When set to one, the End bit indicates the end of a fragmented NAL
-			unit, i.e., the last byte of the payload is also the last byte of
-			the fragmented NAL unit.  When the following FU payload is not the
-			last fragment of a fragmented NAL unit, the End bit is set to
-			zero.
-
-			R: 1 bit
-			The Reserved bit MUST be equal to 0 and MUST be ignored by the
-			receiver.
-
-			Type: 5 bits
-			The NAL unit payload type as defined in table 7-1 of [1].
-		*/
-		fuIndicator := packet[0]
-		fuHeader := packet[1]
-		isStart := fuHeader&0x80 != 0
-		isEnd := fuHeader&0x40 != 0
-		if isStart {
-			self.fuStarted = true
-			self.fuBuffer = []byte{fuIndicator&0xe0 | fuHeader&0x1f}
-		}
-		if self.fuStarted {
-			self.fuBuffer = append(self.fuBuffer, packet[2:]...)
-			if isEnd {
-				self.fuStarted = false
-				if err = self.handleH264Payload(timestamp, self.fuBuffer); err != nil {
-					return
-				}
-			}
-		}
-
-	case naluType == 24: // STAP-A
-		/*
-			0                   1                   2                   3
-			0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|                          RTP Header                           |
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|STAP-A NAL HDR |         NALU 1 Size           | NALU 1 HDR    |
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|                         NALU 1 Data                           |
-			:                                                               :
-			+               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|               | NALU 2 Size                   | NALU 2 HDR    |
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|                         NALU 2 Data                           |
-			:                                                               :
-			|                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-			|                               :...OPTIONAL RTP padding        |
-			+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-			Figure 7.  An example of an RTP packet including an STAP-A
-			containing two single-time aggregation units
-		*/
-		packet = packet[1:]
-		for len(packet) >= 2 {
-			size := int(packet[0])<<8 | int(packet[1])
-			if size+2 > len(packet) {
-				break
-			}
-			if err = self.handleH264Payload(timestamp, packet[2:size+2]); err != nil {
-				return
-			}
-			packet = packet[size+2:]
-		}
-		return
-
-	case naluType >= 6 && naluType <= 23: // other single NALU packet
-	case naluType == 25: // STAB-B
-	case naluType == 26: // MTAP-16
-	case naluType == 27: // MTAP-24
-	case naluType == 28: // FU-B
-
-	default:
-		err = fmt.Errorf("rtsp: unsupported H264 naluType=%d", naluType)
-		return
-	}
-
-	return
-}
-
-func (self *Stream) handleRtpPacket(packet []byte) (err error) {
-	if self.isCodecDataChange() {
-		err = ErrCodecDataChange
-		return
-	}
-
-	if self.client != nil && self.client.DebugRtp {
-		fmt.Println("rtp: packet", self.CodecData.Type(), "len", len(packet))
-		dumpsize := len(packet)
-		if dumpsize > 32 {
-			dumpsize = 32
-		}
-		fmt.Print(hex.Dump(packet[:dumpsize]))
-	}
-
-	/*
-		0                   1                   2                   3
-		0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-		|V=2|P|X|  CC   |M|     PT      |       sequence number         |
-		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-		|                           timestamp                           |
-		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-		|           synchronization source (SSRC) identifier            |
-		+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
-		|            contributing source (CSRC) identifiers             |
-		|                             ....                              |
-		+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-	*/
-	if len(packet) < 8 {
-		err = fmt.Errorf("rtp: packet too short")
-		return
-	}
-	payloadOffset := 12 + int(packet[0]&0xf)*4
-	if payloadOffset > len(packet) {
-		err = fmt.Errorf("rtp: packet too short")
-		return
-	}
-	timestamp := binary.BigEndian.Uint32(packet[4:8])
-	payload := packet[payloadOffset:]
-
-	/*
-		PT 	Encoding Name 	Audio/Video (A/V) 	Clock Rate (Hz) 	Channels 	Reference
-		0	PCMU	A	8000	1	[RFC3551]
-		1	Reserved
-		2	Reserved
-		3	GSM	A	8000	1	[RFC3551]
-		4	G723	A	8000	1	[Vineet_Kumar][RFC3551]
-		5	DVI4	A	8000	1	[RFC3551]
-		6	DVI4	A	16000	1	[RFC3551]
-		7	LPC	A	8000	1	[RFC3551]
-		8	PCMA	A	8000	1	[RFC3551]
-		9	G722	A	8000	1	[RFC3551]
-		10	L16	A	44100	2	[RFC3551]
-		11	L16	A	44100	1	[RFC3551]
-		12	QCELP	A	8000	1	[RFC3551]
-		13	CN	A	8000	1	[RFC3389]
-		14	MPA	A	90000		[RFC3551][RFC2250]
-		15	G728	A	8000	1	[RFC3551]
-		16	DVI4	A	11025	1	[Joseph_Di_Pol]
-		17	DVI4	A	22050	1	[Joseph_Di_Pol]
-		18	G729	A	8000	1	[RFC3551]
-		19	Reserved	A
-		20	Unassigned	A
-		21	Unassigned	A
-		22	Unassigned	A
-		23	Unassigned	A
-		24	Unassigned	V
-		25	CelB	V	90000		[RFC2029]
-		26	JPEG	V	90000		[RFC2435]
-		27	Unassigned	V
-		28	nv	V	90000		[RFC3551]
-		29	Unassigned	V
-		30	Unassigned	V
-		31	H261	V	90000		[RFC4587]
-		32	MPV	V	90000		[RFC2250]
-		33	MP2T	AV	90000		[RFC2250]
-		34	H263	V	90000		[Chunrong_Zhu]
-		35-71	Unassigned	?
-		72-76	Reserved for RTCP conflict avoidance				[RFC3551]
-		77-95	Unassigned	?
-		96-127	dynamic	?			[RFC3551]
-	*/
-	//payloadType := packet[1]&0x7f
-
-	switch self.Sdp.Type {
-	case av.H264:
-		if err = self.handleH264Payload(timestamp, payload); err != nil {
-			return
-		}
-
-	case av.AAC:
-		if len(payload) < 4 {
-			err = fmt.Errorf("rtp: aac packet too short")
-			return
-		}
-		payload = payload[4:] // TODO: remove this hack
-		self.gotpkt = true
-		self.pkt.Data = payload
-		self.timestamp = timestamp
-
-	default:
-		self.gotpkt = true
-		self.pkt.Data = payload
-		self.timestamp = timestamp
-	}
-
-	return
-}
-
 func (self *Client) Play() (err error) {
 	req := Request{
 		Method: "PLAY",
@@ -1122,7 +702,14 @@ func (self *Client) Play() (err error) {
 	return
 }
 
+func (self *Client) closeUDP() {
+	for _, s := range self.streams {
+		s.Close()
+	}
+}
+
 func (self *Client) Teardown() (err error) {
+	defer self.closeUDP()
 	req := Request{
 		Method: "TEARDOWN",
 		Uri:    self.requestUri,
@@ -1135,11 +722,15 @@ func (self *Client) Teardown() (err error) {
 }
 
 func (self *Client) Close() (err error) {
+	self.closeUDP()
 	return self.conn.Conn.Close()
 }
 
 func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error) {
-	_, blockno, _ := self.parseBlockHeader(block)
+	if self.more {
+		panic("more should be false")
+	}
+	_, blockno, _, _, _ := self.parseBlockHeader(block)
 	if blockno%2 != 0 {
 		if self.DebugRtp {
 			fmt.Println("rtsp: rtcp block len", len(block)-4)
@@ -1154,54 +745,76 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 	}
 	stream := self.streams[i]
 
-	herr := stream.handleRtpPacket(block[4:])
-	if herr != nil {
-		if !self.SkipErrRtpBlock {
-			err = herr
-			return
-		}
+	if stream.ctx == nil {
+		err = fmt.Errorf("rtsp: block no=%d demux not avaiable", blockno)
+		return
 	}
 
-	if stream.gotpkt {
-		/*
-			TODO: sync AV by rtcp NTP timestamp
-			TODO: handle timestamp overflow
-			https://tools.ietf.org/html/rfc3550
-			A receiver can then synchronize presentation of the audio and video packets by relating
-			their RTP timestamps using the timestamp pairs in RTCP SR packets.
-		*/
-		if stream.firsttimestamp == 0 {
-			stream.firsttimestamp = stream.timestamp
-		}
-		stream.timestamp -= stream.firsttimestamp
-
-		ok = true
-		pkt = stream.pkt
-		pkt.Time = time.Duration(stream.timestamp) * time.Second / time.Duration(stream.timeScale())
-		pkt.Idx = int8(self.setupMap[i])
-
-		if pkt.Time < stream.lasttime || pkt.Time-stream.lasttime > time.Minute*30 {
-			err = fmt.Errorf("rtp: time invalid stream#%d time=%v lasttime=%v", pkt.Idx, pkt.Time, stream.lasttime)
-			return
-		}
-		stream.lasttime = pkt.Time
-
+	/*
 		if self.DebugRtp {
-			fmt.Println("rtp: pktout", pkt.Idx, pkt.Time, len(pkt.Data))
+			l := 32
+			if l > len(block) {
+				l = len(block)
+			}
+			fmt.Println("raw")
+			fmt.Print(hex.Dump(block[:l]))
 		}
+	*/
 
-		stream.pkt = av.Packet{}
-		stream.gotpkt = false
+	p, more := stream.ctx.RtpParsePacket(block[4:])
+	if p == nil {
+		return
+	}
+	if p != nil {
+		pkt = *p
+		ok = true
+	}
+	pkt.Idx = int8(i)
+	self.more = more
+	if more {
+		self.moreStreamIdx = i
+	}
+
+	if self.DebugRtp {
+		fmt.Println("pkt ", len(pkt.Data), pkt.Time)
+		l := 32
+		if l > len(pkt.Data) {
+			l = len(pkt.Data)
+		}
+		fmt.Print(hex.Dump(pkt.Data[:l]))
 	}
 
 	return
 }
 
-func (self *Client) readPacket() (pkt av.Packet, err error) {
-	if err = self.SendRtpKeepalive(); err != nil {
-		return
+func (self *Client) readUDPPacket() (pkt av.Packet, err error) {
+	for p := range self.udpCh {
+		var timestamp uint32
+		var seq uint16
+		var ok bool
+		if _, _, timestamp, seq, ok = self.parseBlockHeader(p.Data); !ok {
+			continue
+		}
+		p.Timestamp = timestamp
+		p.Sequence = seq
+		if self.DebugRtp {
+			fmt.Println("rtp: ", p.Timestamp, p.Sequence)
+		}
+		// self.streams[no%
+		// reorder
+		if pkt, ok, err = self.handleBlock(p.Data); err != nil {
+			fmt.Println("rtsp: bad block: ", err)
+			return
+		}
+		if ok {
+			return
+		}
 	}
 
+	return
+}
+
+func (self *Client) readTCPPacket() (pkt av.Packet, err error) {
 	for {
 		var res Response
 		for {
@@ -1221,8 +834,27 @@ func (self *Client) readPacket() (pkt av.Packet, err error) {
 			return
 		}
 	}
+}
 
-	return
+func (self *Client) readPacket() (pkt av.Packet, err error) {
+	if err = self.SendRtpKeepalive(); err != nil {
+		return
+	}
+
+	if self.more {
+		p, more := self.streams[self.moreStreamIdx].ctx.RtpParsePacket(nil)
+		self.more = more
+		if p != nil {
+			pkt = *p
+			return
+		}
+	}
+
+	if self.UseUDP {
+		return self.readUDPPacket()
+	} else {
+		return self.readTCPPacket()
+	}
 }
 
 func (self *Client) ReadPacket() (pkt av.Packet, err error) {

@@ -195,6 +195,7 @@ func (self *Session) writeFLVH264Packet(pkt av.Packet) (err error) {
 		err = binary.Write(w, binary.BigEndian, uint16(self.seq))
 		self.seq++
 		// timestamp (90k / fps)
+		// XXX timestamp should start randomly
 		t := (pkt.Time * 90000 / time.Second)
 		err = binary.Write(w, binary.BigEndian, uint32(t))
 		// SSRC
