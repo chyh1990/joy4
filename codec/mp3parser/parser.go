@@ -2,6 +2,7 @@ package mp3parser
 
 import (
 	"bytes"
+	"errors"
 
 	"github.com/nareix/joy4/av"
 )
@@ -33,6 +34,10 @@ func (self CodecData) BitRate() int {
 }
 
 func NewCodecDataFromMP3AudioConfigBytes(config []byte) (self CodecData, err error) {
+	if len(config) == 0 {
+		err = errors.New("empty mp3 config")
+		return
+	}
 	reader := bytes.NewReader(config)
 	decoder := NewDecoder(reader)
 	f := Frame{}

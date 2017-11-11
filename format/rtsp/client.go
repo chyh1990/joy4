@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,8 @@ import (
 )
 
 var ErrCodecDataChange = fmt.Errorf("rtsp: codec data change, please call HandleCodecDataChange()")
+var ErrTimeout = errors.New("rtsp timeout")
+var ErrMaxProbe = errors.New("rtsp max probe reached")
 
 var DebugRtp = false
 var DebugRtsp = false
@@ -32,6 +35,8 @@ const (
 	stageWaitCodecData
 	stageCodecDataDone
 )
+
+const RtspMaxProbeCount = 100
 
 type udpPacket struct {
 	Idx  int
@@ -50,6 +55,7 @@ type Client struct {
 	RtpTimeout          time.Duration
 	RtpKeepAliveTimeout time.Duration
 	rtpKeepaliveTimer   time.Time
+	rtspProbeCount      int
 	// rtpKeepaliveEnterCnt int
 
 	stage int
@@ -154,6 +160,11 @@ func (self *Client) probe() (err error) {
 
 func (self *Client) prepare(stage int) (err error) {
 	for self.stage < stage {
+		self.rtspProbeCount++
+		if self.rtspProbeCount > RtspMaxProbeCount {
+			err = ErrMaxProbe
+			return
+		}
 		switch self.stage {
 		case 0:
 			if _, err = self.Describe(); err != nil {
@@ -776,7 +787,7 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 	}
 
 	if self.DebugRtp {
-		fmt.Println("pkt ", len(pkt.Data), pkt.Time)
+		fmt.Println("rtp: packet len:", len(pkt.Data), "stream:", i, "time:", pkt.Time, "more:", more)
 		l := 32
 		if l > len(pkt.Data) {
 			l = len(pkt.Data)
@@ -787,26 +798,40 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 	return
 }
 
+func (self *Client) rtpTimeoutChannel() <-chan time.Time {
+	if self.RtpTimeout == 0 {
+		return nil
+	}
+	return time.After(self.RtpTimeout)
+}
+
 func (self *Client) readUDPPacket() (pkt av.Packet, err error) {
-	for p := range self.udpCh {
-		var timestamp uint32
-		var seq uint16
-		var ok bool
-		if _, _, timestamp, seq, ok = self.parseBlockHeader(p.Data); !ok {
-			continue
-		}
-		p.Timestamp = timestamp
-		p.Sequence = seq
-		if self.DebugRtp {
-			fmt.Println("rtp: ", p.Timestamp, p.Sequence)
-		}
-		// self.streams[no%
-		// reorder
-		if pkt, ok, err = self.handleBlock(p.Data); err != nil {
-			fmt.Println("rtsp: bad block: ", err)
-			return
-		}
-		if ok {
+	for {
+		select {
+		case p, ok := <-self.udpCh:
+			if !ok {
+				err = io.EOF
+				return
+			}
+			var timestamp uint32
+			var seq uint16
+			if _, _, timestamp, seq, ok = self.parseBlockHeader(p.Data); !ok {
+				continue
+			}
+			p.Timestamp = timestamp
+			p.Sequence = seq
+			if self.DebugRtp {
+				fmt.Println("rtp: ", p.Timestamp, p.Sequence)
+			}
+			if pkt, ok, err = self.handleBlock(p.Data); err != nil {
+				fmt.Println("rtsp: bad block: ", err)
+				return
+			}
+			if ok {
+				return
+			}
+		case <-time.After(self.RtpTimeout):
+			err = ErrTimeout
 			return
 		}
 	}
