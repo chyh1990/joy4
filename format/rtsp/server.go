@@ -355,7 +355,7 @@ func (self *Conn) doDescribe(uri *url.URL, headers textproto.MIMEHeader) error {
 		sdps = append(sdps, fmt.Sprintf("a=rtpmap:%d H264/90000", h264DynamincType))
 		sps := base64.StdEncoding.EncodeToString(ty.SPS())
 		pps := base64.StdEncoding.EncodeToString(ty.PPS())
-		sdps = append(sdps, fmt.Sprintf("a=fmtp:%d packetization-mode=1; sprop-parameter-sets=%s", h264DynamincType, strings.Join([]string{sps, pps}, ",")))
+		sdps = append(sdps, fmt.Sprintf("a=fmtp:%d packetization-mode=1;sprop-parameter-sets=%s,%s", h264DynamincType, sps, pps))
 	}
 	buf := strings.Join(sdps, "\n")
 	lines := []string{
@@ -381,10 +381,19 @@ func (self *Conn) doSetup(uri *url.URL, headers textproto.MIMEHeader) error {
 			idx, _ = strconv.Atoi(t[0])
 		}
 	}
+	transportParams := strings.Split(headers.Get("Transport"), ";")
+	if len(transportParams) == 0 || transportParams[0] != "RTP/AVP/TCP" {
+		self.writeStatus(501, "Not Implemented")
+		return nil
+	}
 	// check
 	streams, err := self.publish(uri, headers)
 	if err != nil {
 		return err
+	}
+	if idx >= len(streams) {
+		self.writeStatus(404, "Not Found")
+		return nil
 	}
 	var sessionID string
 	for {
@@ -419,11 +428,11 @@ func (self *Conn) doSetup(uri *url.URL, headers textproto.MIMEHeader) error {
 }
 
 func (self *Conn) findSession(headers textproto.MIMEHeader) *Session {
-	sessionID, ok := headers["Session"]
-	if !ok || len(sessionID) < 1 {
+	sessionID := headers.Get("Session")
+	if sessionID == "" {
 		return nil
 	}
-	session, ok := self.sessions[sessionID[0]]
+	session, ok := self.sessions[sessionID]
 	if !ok {
 		return nil
 	}
@@ -488,14 +497,12 @@ func (self *Conn) dispatch(line string) error {
 		fmt.Println(line, headers)
 	}
 
-	if cseq, ok := headers["Cseq"]; ok {
-		if len(cseq) > 0 {
-			cseq, err := strconv.Atoi(cseq[0])
-			if err != nil {
-				return err
-			}
-			self.cseq = uint(cseq)
+	if cseq := headers.Get("Cseq"); cseq != "" {
+		cseq, err := strconv.Atoi(cseq)
+		if err != nil {
+			return err
 		}
+		self.cseq = uint(cseq)
 	}
 
 	switch cmd {

@@ -614,6 +614,10 @@ func (self *Client) Setup() (err error) {
 		if resp, err = self.ReadResponse(); err != nil {
 			return
 		}
+		if resp.StatusCode != 200 {
+			err = fmt.Errorf("rtsp: setup response code=%d", resp.StatusCode)
+			return
+		}
 
 		if self.UseUDP {
 			self.streams[si].sendPunch(self.requestUri, &resp)
