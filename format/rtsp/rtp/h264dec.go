@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nareix/bits/pio"
 	"github.com/nareix/joy4/av"
 	"github.com/nareix/joy4/codec/h264parser"
 	"github.com/nareix/joy4/format/rtsp/sdp"
@@ -18,6 +19,9 @@ type H264DynamicProtocol struct {
 
 	sps []byte
 	pps []byte
+
+	fuStarted bool
+	fuBuffer  []byte
 }
 
 var startSequence = []byte{0, 0, 0, 1}
@@ -27,6 +31,7 @@ func (h *H264DynamicProtocol) Type() av.CodecType {
 }
 
 const NAL_MASK = 0x1f
+const MaxFUBufferSize = 10 << 20
 
 func (h *H264DynamicProtocol) parseFragPacket(pkt *av.Packet, buf []byte, startBit byte, nalHeader []byte) {
 	totLen := len(buf)
@@ -42,6 +47,53 @@ func (h *H264DynamicProtocol) parseFragPacket(pkt *av.Packet, buf []byte, startB
 		pos += len(nalHeader)
 	}
 	copy(pkt.Data[pos:], buf)
+}
+
+func (h *H264DynamicProtocol) resetFUState() {
+	h.fuStarted = false
+	h.fuBuffer = nil
+}
+
+/*
+	0                   1                   2                   3
+	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|                          RTP Header                           |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|STAP-A NAL HDR |         NALU 1 Size           | NALU 1 HDR    |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|                         NALU 1 Data                           |
+	:                                                               :
+	+               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|               | NALU 2 Size                   | NALU 2 HDR    |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|                         NALU 2 Data                           |
+	:                                                               :
+	|                               +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|                               :...OPTIONAL RTP padding        |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+	Figure 7.  An example of an RTP packet including an STAP-A
+	containing two single-time aggregation units
+*/
+
+func (h *H264DynamicProtocol) parseAggregatedPacket(pkt *av.Packet, buf []byte, skipBetween int, nalMask int) int {
+	count := 0
+	for len(buf) >= 2 {
+		size := int(pio.U16BE(buf))
+		if size+2 > len(buf) {
+			break
+		}
+		offset := len(pkt.Data)
+		pkt.Data = append(pkt.Data, []byte{0, 0, 0, 0}...)
+		pkt.Data = append(pkt.Data, buf[2:size+2]...)
+		pio.PutU32BE(pkt.Data[offset:], uint32(size))
+		buf = buf[size+2:]
+	}
+	if count == 0 {
+		return -1
+	}
+	return 0
 }
 
 func (h *H264DynamicProtocol) parseFUAPacket(pkt *av.Packet, buf []byte, nalMask int) int {
@@ -101,18 +153,36 @@ func (h *H264DynamicProtocol) parseFUAPacket(pkt *av.Packet, buf []byte, nalMask
 
 	fuIndicator := buf[0]
 	fuHeader := buf[1]
-	startBit := fuHeader >> 7
+	isStart := fuHeader&0x80 != 0
+	isEnd := fuHeader&0x40 != 0
+
 	naltype := fuHeader & 0x1f
 	nal := fuIndicator&0xe0 | naltype
 
-	// fmt.Println("nal", naltype)
-	pkt.IsKeyFrame = naltype == h264parser.NALU_IDR_SLICE
+	if isStart {
+		h.fuStarted = true
+		h.fuBuffer = []byte{0, 0, 0, 0, nal}
+	}
+	if h.fuStarted {
+		h.fuBuffer = append(h.fuBuffer, buf[2:]...)
+		if isEnd {
+			pkt.IsKeyFrame = h.fuBuffer[0]&0x1f == h264parser.NALU_IDR_SLICE
+			// no need to copy
+			pkt.Data = h.fuBuffer
+			pio.PutU32BE(pkt.Data[0:4], uint32(len(h.fuBuffer)-4))
+			h.resetFUState()
+			return 0
+		}
+	}
+	if len(h.fuBuffer) > MaxFUBufferSize {
+		h.resetFUState()
+	}
 
-	h.parseFragPacket(pkt, buf[2:], startBit, []byte{nal})
-	return 0
+	return -1
 }
 
-// return 0 on packet, no more left, 1 on packet, 1 on partial packet
+// return 0 on packet, no more left, 1 on packet, -1 on partial packet
+// return AVCC packet
 func (h *H264DynamicProtocol) ParsePacket(pkt *av.Packet, buf []byte, timestamp uint32, flags int) (uint32, int) {
 	rv := 0
 	if len(buf) == 0 {
@@ -138,6 +208,10 @@ func (h *H264DynamicProtocol) ParsePacket(pkt *av.Packet, buf []byte, timestamp 
 		30-31    reserved                                     -
 	*/
 
+	if naltype != 28 && naltype != 29 {
+		h.resetFUState()
+	}
+
 	switch {
 	case naltype == 0: // undefined, but pass them through
 		fallthrough
@@ -148,11 +222,14 @@ func (h *H264DynamicProtocol) ParsePacket(pkt *av.Packet, buf []byte, timestamp 
 		isKeyFrame := naltype == h264parser.NALU_IDR_SLICE
 		// avcc mode
 		pkt.Data = make([]byte, 4+len(buf))
-		copy(pkt.Data, startSequence)
+		pio.PutU32BE(pkt.Data, uint32(len(buf)))
 		copy(pkt.Data[4:], buf)
 		if isKeyFrame {
 			pkt.IsKeyFrame = true
 		}
+	case naltype == 24: // STAP-A (one packet, multiple nals)
+		buf = buf[1:]
+		rv = h.parseAggregatedPacket(pkt, buf, 0, NAL_MASK)
 	case naltype == 28: // FU-A (fragmented nal)
 		rv = h.parseFUAPacket(pkt, buf, NAL_MASK)
 	default:

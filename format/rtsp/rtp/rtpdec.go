@@ -521,8 +521,8 @@ func (s *RTPDemuxContext) SetDynamicHandlerByCodecType(t av.CodecType) bool {
 
 func (s *RTPDemuxContext) SetDynamicHandlerByStaticId(id int) bool {
 	switch id {
-	case 14:
-		s.DynamicProtocol = &MP3DynamicProtocol{}
+	// case 14:
+	// 	s.DynamicProtocol = &MP3DynamicProtocol{}
 	default:
 		return false
 	}
