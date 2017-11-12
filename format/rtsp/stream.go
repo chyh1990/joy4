@@ -48,8 +48,22 @@ func (self *Stream) sendPunchInternal(host string, idx int, port int) {
 	if err != nil {
 		return
 	}
+	var dummy []byte
+	if idx == 0 {
+		// small RTP
+		dummy = []byte{
+			rtp.RTP_VERSION << 6, 0, 0, 0,
+			0, 0, 0, 0,
+			0, 0, 0, 0,
+		}
+	} else {
+		// small RTCP
+		dummy = []byte{rtp.RTP_VERSION << 6, rtp.RTCP_RR, 0, 1,
+			0, 0, 0, 0,
+		}
+	}
 	for i := 0; i < 3; i++ {
-		self.udpConns[idx].WriteToUDP([]byte{0x00, 0x00, 0x00, 0x00}, udpAddr)
+		self.udpConns[idx].WriteToUDP(dummy, udpAddr)
 	}
 }
 
