@@ -58,6 +58,7 @@ func main() {
 			var err error
 
 			<-session.Events()
+			startTime := time.Now()
 			for session.IsPlaying() {
 				var pkt av.Packet
 				if pkt, err = src.ReadPacket(); err != nil {
@@ -66,25 +67,29 @@ func main() {
 						break
 					}
 				}
+				fromStart := time.Now().Sub(startTime)
 				if pkt.Idx == 0 && len(pkt.Data) > 4 {
 					nalus, _ := h264parser.SplitNALUs(pkt.Data)
 					for _, nal := range nalus {
 						switch h264parser.NALUType(nal) {
 						case h264parser.NALU_IDR_SLICE, h264parser.NALU_NON_IDR_SLICE:
 							header, _ := h264parser.ParseSliceHeaderFromNALU(nal)
-							fmt.Println("frame: ", pkt.IsKeyFrame, header)
+							fmt.Println(fromStart, "frame: ", pkt.IsKeyFrame, header)
 						case h264parser.NALU_SEI:
 							sei, _ := h264parser.ParseSEIMessageFromNALU(nal)
-							fmt.Println("SEI: ", sei.Type, sei.PayloadSize)
+							fmt.Println(fromStart, "SEI: ", sei.Type, sei.PayloadSize)
 							fmt.Print(hex.Dump(sei.Payload))
 						}
 						pkt.Data = nal
+
+						if pkt.Time > fromStart {
+							time.Sleep(pkt.Time - fromStart)
+						}
 						if err = session.WritePacket(pkt); err != nil {
 							break
 						}
 					}
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 			fmt.Println("done: ", err)
 		}()
